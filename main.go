@@ -1,0 +1,317 @@
+package main
+
+import (
+	"archive/tar"
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/docker/docker/api/types/build"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/client"
+	"github.com/docker/go-connections/nat"
+	"github.com/sst/opencode-sdk-go"
+	"github.com/sst/opencode-sdk-go/option"
+)
+
+const (
+	imageTag           = "opencode-app:latest"
+	containerName      = "opencode-instance"
+	relativeMountPath  = "./opencode_data"
+	containerMountPath = "/root/.local/share/opencode"
+
+	hostIP        = "0.0.0.0"
+	hostPort      = "3000"
+	containerPort = "3000"
+
+	dockerfilePath = "Dockerfile"
+	sessionTitle   = "opencode development session"
+	promptText     = "What are list of files and dir u can see?"
+
+	stopContainerOnExit = true
+)
+
+func imageExists(ctx context.Context, cli *client.Client, imageName string) (bool, error) {
+	images, err := cli.ImageList(ctx, image.ListOptions{
+		Filters: filters.NewArgs(filters.Arg("reference", imageName)),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to get image list: %w", err)
+	}
+	return len(images) > 0, nil
+}
+
+func buildImageFromDockerfileOnly(
+	ctx context.Context,
+	logger *slog.Logger,
+	cli *client.Client,
+	dockerfilePath string,
+	imageTag string,
+) error {
+	pr, pw := io.Pipe()
+
+	go func() {
+		tw := tar.NewWriter(pw)
+		defer tw.Close()
+		defer pw.Close()
+
+		content, err := os.ReadFile(dockerfilePath)
+		if err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("read dockerfile %q: %w", dockerfilePath, err))
+			return
+		}
+
+		hdr := &tar.Header{
+			Name: "Dockerfile",
+			Mode: 0600,
+			Size: int64(len(content)),
+		}
+
+		if err := tw.WriteHeader(hdr); err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("write dockerfile header: %w", err))
+			return
+		}
+
+		if _, err := tw.Write(content); err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("write dockerfile content: %w", err))
+			return
+		}
+	}()
+
+	res, err := cli.ImageBuild(ctx, pr, build.ImageBuildOptions{
+		Tags:        []string{imageTag},
+		Dockerfile:  "Dockerfile",
+		Remove:      true,
+		ForceRemove: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to build the image: %w", err)
+	}
+	defer res.Body.Close()
+
+	scanner := bufio.NewScanner(res.Body)
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 1024*1024)
+
+	for scanner.Scan() {
+		logger.Info("docker build", "output", scanner.Text())
+	}
+
+	return scanner.Err()
+}
+
+func ensureContainerRunning(
+	ctx context.Context,
+	logger *slog.Logger,
+	cli *client.Client,
+	name, imageTag, hostIP, hostPort, containerPort, mountSource, mountTarget string,
+) (string, bool, error) {
+	containers, err := cli.ContainerList(ctx, container.ListOptions{
+		All:     true,
+		Filters: filters.NewArgs(filters.Arg("name", name)),
+	})
+	if err != nil {
+		return "", false, fmt.Errorf("failed to get containers list: %w", err)
+	}
+
+	for _, ctr := range containers {
+		for _, n := range ctr.Names {
+			if n != fmt.Sprintf("/%s", containerName) {
+				continue
+			}
+
+			if ctr.State == "running" {
+				logger.Info("container already running", "container_id", ctr.ID, "name", name)
+				return ctr.ID, false, nil
+			}
+
+			logger.Info("starting existing container", "container_id", ctr.ID, "state", ctr.State)
+			if err := cli.ContainerStart(ctx, ctr.ID, container.StartOptions{}); err != nil {
+				return "", false, err
+			}
+			return ctr.ID, true, nil
+		}
+	}
+
+	portKey, err := nat.NewPort("tcp", containerPort)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to bind the port to continer: %w", err)
+	}
+
+	resp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image:        imageTag,
+		ExposedPorts: nat.PortSet{portKey: struct{}{}},
+	}, &container.HostConfig{
+		PortBindings: nat.PortMap{portKey: []nat.PortBinding{
+			{
+				HostIP:   hostIP,
+				HostPort: hostPort,
+			},
+		}},
+		Mounts: []mount.Mount{
+			{
+				Type:     mount.TypeBind, // Use TypeVolume for named volumes
+				Source:   mountSource,    //"/path/on/host", // Absolute path on host
+				Target:   mountTarget,    //"/path/in/container",
+				ReadOnly: false,          // Optional: set to true for read-only
+			},
+		},
+	}, nil, nil, name)
+	if err != nil {
+		return "", false, fmt.Errorf("failed to create the container named '%s': %w", name, err)
+	}
+
+	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+		return "", false, fmt.Errorf("failed to start the container name '%s': %w", name, err)
+	}
+
+	logger.Info("created and started new container", "container_id", resp.ID, "name", name)
+	return resp.ID, true, nil
+}
+
+func ensureSession(
+	ctx context.Context,
+	logger *slog.Logger,
+	client *opencode.Client,
+	title string,
+) (*opencode.Session, error) {
+	sessions, err := client.Session.List(ctx, opencode.SessionListParams{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the sessions list: %w", err)
+	}
+	if sessions == nil {
+		return nil, errors.New("session list returned nil")
+	}
+
+	if len(*sessions) == 0 {
+		logger.Info("creating new session", "title", title)
+		return client.Session.New(ctx, opencode.SessionNewParams{
+			Title: opencode.F(title),
+		})
+	}
+
+	logger.Info("reusing existing session", "session_id", (*sessions)[0].ID, "count", len(*sessions))
+	return &(*sessions)[0], nil
+}
+
+func main() {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	dockerClient, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		logger.Error("failed to create docker client", "err", err)
+		os.Exit(1)
+	}
+	defer dockerClient.Close()
+
+	logger.Info("starting",
+		"image", imageTag,
+		"container", containerName,
+		"host_port", hostPort,
+		"container_port", containerPort,
+	)
+
+	imageExists, err := imageExists(ctx, dockerClient, imageTag)
+	if err != nil {
+		logger.Error("application failed in check image", "err", err)
+		os.Exit(1)
+	}
+
+	if !imageExists {
+		logger.Info("image not found, building", "image", imageTag)
+
+		buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+		defer cancel()
+
+		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, imageTag); err != nil {
+			logger.Error("application failed in build image", "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// absMountPath, err := filepath.Abs(relativeMountPath)
+	// if err != nil {
+	// 	logger.Error("application failed to get absolute host path", "err", err)
+	// 	os.Exit(1)
+	// }
+
+	containerID, startedNow, err := ensureContainerRunning(
+		ctx,
+		logger,
+		dockerClient,
+		containerName,
+		imageTag,
+		hostIP,
+		hostPort,
+		containerPort,
+		// absMountPath,
+		"/Users/sithumsandeepa/pokunuvita/opencode_data", //absMountPath,
+		containerMountPath,
+	)
+	if err != nil {
+		logger.Error("application failed in ensure container", "err", err)
+		os.Exit(1)
+	}
+
+	if startedNow {
+		logger.Info("waiting for container startup")
+		time.Sleep(5 * time.Second) // do we really need this?
+	}
+
+	opencodeOptions := []option.RequestOption{
+		option.WithBaseURL(fmt.Sprintf("http://localhost:%s", hostPort)),
+	}
+
+	opencodeClient := opencode.NewClient(opencodeOptions...)
+
+	opencodeSession, err := ensureSession(ctx, logger, opencodeClient, sessionTitle)
+	if err != nil {
+		logger.Error("application failed in ensure session", "err", err)
+		os.Exit(1)
+	}
+
+	logger.Info("using session", "session_id", opencodeSession.ID, "directory", opencodeSession.Directory)
+
+	promptResp, err := opencodeClient.Session.Prompt(context.TODO(), opencodeSession.ID, opencode.SessionPromptParams{
+		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
+			opencode.TextPartInputParam{
+				Type: opencode.F(opencode.TextPartInputTypeText),
+				Text: opencode.F(promptText),
+			},
+		}),
+	})
+
+	if err != nil {
+		logger.Error("application failed in send prompt", "err", err)
+		os.Exit(1)
+	}
+
+	for _, part := range promptResp.Parts {
+		if textPart, ok := part.AsUnion().(opencode.TextPart); ok {
+			logger.Info("response", "text", textPart.Text)
+		}
+	}
+
+	if stopContainerOnExit {
+		logger.Info("stopping container", "container_id", containerID)
+		// if err := dockerClient.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
+		// 	logger.Error("application failed in stop container", "err", err)
+		// 	os.Exit(1)
+		// }
+	}
+
+	logger.Info("completed successfully")
+}
