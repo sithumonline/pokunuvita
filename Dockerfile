@@ -2,14 +2,18 @@ FROM golang:1.25-alpine AS builder
 
 ENV SHELL=/bin/sh
 
-RUN apk add --no-cache curl git libgcc libstdc++ ripgrep
+RUN apk add --no-cache curl git libgcc libstdc++ ripgrep github-cli
 
 RUN curl -fsSL https://opencode.ai/install | sh
 
 ENV PATH="/root/.opencode/bin:${PATH}"
 
-RUN git clone https://github.com/anomalyco/opencode-sdk-go.git /app/opencode-sdk-go
+RUN git config --global user.email "sithumsandeepap@gmail.com" && git config --global user.name "Sithum Bopitiya"
 
-WORKDIR /app/opencode-sdk-go
+RUN git clone https://github.com/sithumonline/movie-box.git /app/movie-box
+
+WORKDIR /app/movie-box
+
+RUN go mod tidy
 
 CMD [ "opencode", "--port", "3000", "--hostname", "0.0.0.0" ]

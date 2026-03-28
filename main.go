@@ -34,7 +34,7 @@ const (
 
 	dockerfilePath = "Dockerfile"
 	sessionTitle   = "opencode development session"
-	promptText     = "What are list of files and dir u can see?"
+	promptText     = "Create a branch, upgrade packagers, check everything is okay then commit, push and create a pull request." //"What are list of files and dir u can see?"
 
 	stopContainerOnExit = true
 )
@@ -146,9 +146,18 @@ func ensureContainerRunning(
 		return "", false, fmt.Errorf("failed to bind the port to continer: %w", err)
 	}
 
+	var envList []string
+	if env, ok := os.LookupEnv("OPENAI_API_KEY"); ok {
+		envList = append(envList, fmt.Sprintf("OPENAI_API_KEY=%s", env))
+	}
+	if env, ok := os.LookupEnv("GITHUB_TOKEN"); ok {
+		envList = append(envList, fmt.Sprintf("GITHUB_TOKEN=%s", env))
+	}
+
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:        imageTag,
 		ExposedPorts: nat.PortSet{portKey: struct{}{}},
+		Env:          envList,
 	}, &container.HostConfig{
 		PortBindings: nat.PortMap{portKey: []nat.PortBinding{
 			{
