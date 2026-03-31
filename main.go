@@ -34,7 +34,62 @@ const (
 
 	dockerfilePath = "Dockerfile"
 	sessionTitle   = "opencode development session"
-	promptText     = "Create a branch, upgrade packagers, check everything is okay then commit, push and create a pull request." //"What are list of files and dir u can see?"
+	promptText     = `
+You are working inside a Docker container on a Go repository. Complete the following upgrade workflow end-to-end:
+
+## 1. Fix git push authentication
+- Before doing anything else, reconfigure the git remote to use the GH_TOKEN env var:
+  REPO_URL=$(git remote get-url origin)
+  OWNER_REPO=$(echo $REPO_URL | sed 's/.*github.com[:/]\(.*\)\.git/\1/')
+  git remote set-url origin https://${GH_TOKEN}@github.com/${OWNER_REPO}.git
+- Verify the remote is set correctly: git remote get-url origin
+
+## 2. Create a branch
+- Create and switch to a new branch named: 'chore/dependency-upgrades'
+
+## 3. Upgrade the Go version (if possible)
+- Check the current Go version in 'go.mod'
+- Find the latest stable Go version available in this environment ('go version' or check https://go.dev/dl/)
+- If a newer stable version is available, update the 'go' directive in 'go.mod' accordingly
+- Run 'go mod tidy' after any version change
+
+## 4. Upgrade all dependencies
+- Run 'go get -u ./...' to upgrade all direct and indirect dependencies to their latest minor/patch versions
+- Run 'go mod tidy' to clean up 'go.mod' and 'go.sum'
+
+## 5. Verify everything is okay
+- Run 'go build ./...' — must pass with no errors
+- Run 'go vet ./...' — must pass with no warnings
+- Run 'go test ./...' — all tests must pass
+- If any step fails, diagnose and fix the issue before proceeding. Do NOT continue to commit if checks fail.
+
+## 6. Commit and push
+- Stage all changes: 'git add go.mod go.sum'
+- Write a clear, conventional commit message summarising what was upgraded (e.g. 'chore: upgrade go version and dependencies')
+- Push the branch: 'git push -u origin chore/dependency-upgrades'
+
+## 7. Create a pull request via the GitHub REST API
+- Detect the default base branch: 'git remote show origin | grep 'HEAD branch' | awk '{print $NF}''
+- Build the PR body by summarising the Go version change (if any) and key dependency bumps from 'git diff origin/<base>...HEAD -- go.mod'
+- Create the PR using curl and the GH_TOKEN env var:
+
+curl -s -X POST \
+  -H "Authorization: Bearer ${GH_TOKEN}" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  https://api.github.com/repos/${OWNER_REPO}/pulls \
+  -d '{
+    "title": "chore: upgrade Go version and dependencies",
+    "head": "chore/dependency-upgrades",
+    "base": "<default-branch>",
+    "body": "<generated-body>"
+  }'
+
+- Parse the response and report the PR URL ('html_url' field) on success
+- If the API returns an error (non-201 status), print the full response and stop
+
+Report back with the outcome of each step.
+	`
 
 	stopContainerOnExit = true
 )
@@ -150,8 +205,8 @@ func ensureContainerRunning(
 	if env, ok := os.LookupEnv("OPENAI_API_KEY"); ok {
 		envList = append(envList, fmt.Sprintf("OPENAI_API_KEY=%s", env))
 	}
-	if env, ok := os.LookupEnv("GITHUB_TOKEN"); ok {
-		envList = append(envList, fmt.Sprintf("GITHUB_TOKEN=%s", env))
+	if env, ok := os.LookupEnv("GH_TOKEN"); ok {
+		envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
 	}
 
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
@@ -316,10 +371,10 @@ func main() {
 
 	if stopContainerOnExit {
 		logger.Info("stopping container", "container_id", containerID)
-		// if err := dockerClient.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
-		// 	logger.Error("application failed in stop container", "err", err)
-		// 	os.Exit(1)
-		// }
+		if err := dockerClient.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
+			logger.Error("application failed in stop container", "err", err)
+			os.Exit(1)
+		}
 	}
 
 	logger.Info("completed successfully")

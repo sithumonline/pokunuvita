@@ -55,3 +55,14 @@
 ## Mar 27, 2026
 * Refined the core logic and architecture, drawing inspiration from AI-assisted refactoring patterns.
 * Successfully implemented Docker Volume Mounts using the Go client library to manage persistent data across container lifecycles.
+
+## Mar 28, 2026
+* Set up the official Git repository for the project.
+* Installing and configuring the GitHub CLI (gh) inside the Docker container.
+* Initiated development of the AI-driven Pull Request orchestration workflow.
+
+## Mar 29, 2026
+* Perfecting the logic that allows the AI to open a Pull Request once the code is ready.
+
+## Mar 30, 2026
+* Finally managed to push the code to GitHub and open a PR.
