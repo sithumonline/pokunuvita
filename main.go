@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand"
+	"net"
 	"os"
 	"time"
 
@@ -18,6 +20,8 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
+	"github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
 )
@@ -27,6 +31,9 @@ const (
 	containerName      = "opencode-instance"
 	relativeMountPath  = "./opencode_data"
 	containerMountPath = "/root/.local/share/opencode"
+
+	gh_username   = "sithumonline"
+	gh_repository = "movie-box"
 
 	hostIP        = "0.0.0.0"
 	hostPort      = "3000"
@@ -110,6 +117,7 @@ func buildImageFromDockerfileOnly(
 	cli *client.Client,
 	dockerfilePath string,
 	imageTag string,
+	gh_uname, gh_repo string,
 ) error {
 	pr, pw := io.Pipe()
 
@@ -141,12 +149,66 @@ func buildImageFromDockerfileOnly(
 		}
 	}()
 
+	// 1. Define your secrets in a map
+	secretData := map[string][]byte{
+		"GH_USERNAME":   []byte(gh_uname),
+		"GH_REPOSITORY": []byte(gh_repo),
+	}
+
+	if env, ok := os.LookupEnv("GH_TOKEN"); ok {
+		// envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
+		secretData["GH_TOKEN"] = []byte(env)
+		logger.DebugContext(ctx, "GH_TOKEN found")
+	} else {
+		logger.DebugContext(ctx, "GH_TOKEN not found")
+	}
+
+	// https://github.com/kreuzwerker/terraform-provider-docker/blob/5c3c660fb54e52ccfd82b76ceb685bc82aed7885/internal/provider/resource_docker_image_funcs.go#L408
+
+	// 2. Create a session with a secret provider
+	// s, _ := session.NewSession(ctx, "my-build-session")
+	sessionKey := fmt.Sprintf("docker-provider-%d", rand.Int63())
+	// log.Printf("[DEBUG] Creating BuildKit session with key: %s", sessionKey)
+	logger.DebugContext(ctx, "creating BuildKit session with key", "sessionKey", sessionKey)
+	s, _ := session.NewSession(ctx, sessionKey)
+	s.Allow(secretsprovider.FromMap(secretData))
+
+	// 3. Start the session in the background
+	// go func() {
+	// 	s.Run(ctx, cli.DialSession)
+	// }()
+	// defer s.Close()
+	dialSession := func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
+		return cli.DialHijack(ctx, "/session", proto, meta)
+	}
+	done := make(chan struct{})
+	go func() {
+		s.Run(ctx, dialSession) //nolint:errcheck
+		close(done)
+	}()
+
+	// 4. Update ImageBuildOptions
 	res, err := cli.ImageBuild(ctx, pr, build.ImageBuildOptions{
 		Tags:        []string{imageTag},
 		Dockerfile:  "Dockerfile",
 		Remove:      true,
 		ForceRemove: true,
+		// IMPORTANT: Set Version to BuildKit and provide the SessionID
+		Version:   build.BuilderBuildKit,
+		SessionID: s.ID(),
 	})
+
+	// buildArgs := make(map[string]*string)
+	// buildArgs["GH_USERNAME"] = &gh_uname
+	// buildArgs["GH_REPOSITORY"] = &gh_repo
+
+	// res, err := cli.ImageBuild(ctx, pr, build.ImageBuildOptions{
+	// 	Tags:        []string{imageTag},
+	// 	Dockerfile:  "Dockerfile",
+	// 	Remove:      true,
+	// 	ForceRemove: true,
+	// 	BuildArgs:   buildArgs,
+	// })
 	if err != nil {
 		return fmt.Errorf("failed to build the image: %w", err)
 	}
@@ -167,7 +229,7 @@ func ensureContainerRunning(
 	ctx context.Context,
 	logger *slog.Logger,
 	cli *client.Client,
-	name, imageTag, hostIP, hostPort, containerPort, mountSource, mountTarget string,
+	name, imageTag, hostIP, hostPort, containerPort, mountSource, mountTarget string, //, gh_uname, gh_repo string,
 ) (string, bool, error) {
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
@@ -201,13 +263,20 @@ func ensureContainerRunning(
 		return "", false, fmt.Errorf("failed to bind the port to continer: %w", err)
 	}
 
+	// envList := []string{fmt.Sprintf("GH_USERNAME=%s", gh_uname), fmt.Sprintf("GH_REPOSITORY=%s", gh_repo)}
 	var envList []string
 	if env, ok := os.LookupEnv("OPENAI_API_KEY"); ok {
 		envList = append(envList, fmt.Sprintf("OPENAI_API_KEY=%s", env))
+		logger.DebugContext(ctx, "OPENAI_API_KEY found")
+	} else {
+		logger.DebugContext(ctx, "OPENAI_API_KEY not found")
 	}
-	if env, ok := os.LookupEnv("GH_TOKEN"); ok {
-		envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
-	}
+	// if env, ok := os.LookupEnv("GH_TOKEN"); ok {
+	// 	envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
+	// 	logger.DebugContext(ctx, "GH_TOKEN found")
+	// } else {
+	// 	logger.DebugContext(ctx, "GH_TOKEN not found")
+	// }
 
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:        imageTag,
@@ -268,7 +337,7 @@ func ensureSession(
 
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: slog.LevelDebug,
 	}))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -300,7 +369,7 @@ func main() {
 		buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
 
-		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, imageTag); err != nil {
+		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, imageTag, gh_username, gh_repository); err != nil {
 			logger.Error("application failed in build image", "err", err)
 			os.Exit(1)
 		}
@@ -324,6 +393,8 @@ func main() {
 		// absMountPath,
 		"/Users/sithumsandeepa/pokunuvita/opencode_data", //absMountPath,
 		containerMountPath,
+		// gh_username,
+		// gh_repository,
 	)
 	if err != nil {
 		logger.Error("application failed in ensure container", "err", err)

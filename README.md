@@ -66,3 +66,9 @@
 
 ## Mar 30, 2026
 * Finally managed to push the code to GitHub and open a PR.
+
+## Mar 31, 2026
+* Began implementing dynamic Docker builds.
+
+## Apr 01, 2026
+* Still working on dynamic Docker builds.
