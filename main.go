@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand"
-	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/build"
@@ -20,17 +21,16 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
-	"github.com/moby/buildkit/session"
-	"github.com/moby/buildkit/session/secrets/secretsprovider"
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
 )
 
 const (
-	imageTag           = "opencode-app:latest"
-	containerName      = "opencode-instance"
-	relativeMountPath  = "./opencode_data"
-	containerMountPath = "/root/.local/share/opencode"
+	imageTag            = "opencode-app:latest"
+	containerName       = "opencode-instance"
+	relativeMountPath   = "./opencode_data"
+	containerMountPath  = "/root/.local/share/opencode"
+	repositoryMountPath = "/app/repository"
 
 	gh_username   = "sithumonline"
 	gh_repository = "movie-box"
@@ -117,7 +117,6 @@ func buildImageFromDockerfileOnly(
 	cli *client.Client,
 	dockerfilePath string,
 	imageTag string,
-	gh_uname, gh_repo string,
 ) error {
 	pr, pw := io.Pipe()
 
@@ -149,66 +148,12 @@ func buildImageFromDockerfileOnly(
 		}
 	}()
 
-	// 1. Define your secrets in a map
-	secretData := map[string][]byte{
-		"GH_USERNAME":   []byte(gh_uname),
-		"GH_REPOSITORY": []byte(gh_repo),
-	}
-
-	if env, ok := os.LookupEnv("GH_TOKEN"); ok {
-		// envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
-		secretData["GH_TOKEN"] = []byte(env)
-		logger.DebugContext(ctx, "GH_TOKEN found")
-	} else {
-		logger.DebugContext(ctx, "GH_TOKEN not found")
-	}
-
-	// https://github.com/kreuzwerker/terraform-provider-docker/blob/5c3c660fb54e52ccfd82b76ceb685bc82aed7885/internal/provider/resource_docker_image_funcs.go#L408
-
-	// 2. Create a session with a secret provider
-	// s, _ := session.NewSession(ctx, "my-build-session")
-	sessionKey := fmt.Sprintf("docker-provider-%d", rand.Int63())
-	// log.Printf("[DEBUG] Creating BuildKit session with key: %s", sessionKey)
-	logger.DebugContext(ctx, "creating BuildKit session with key", "sessionKey", sessionKey)
-	s, _ := session.NewSession(ctx, sessionKey)
-	s.Allow(secretsprovider.FromMap(secretData))
-
-	// 3. Start the session in the background
-	// go func() {
-	// 	s.Run(ctx, cli.DialSession)
-	// }()
-	// defer s.Close()
-	dialSession := func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
-		return cli.DialHijack(ctx, "/session", proto, meta)
-	}
-	done := make(chan struct{})
-	go func() {
-		s.Run(ctx, dialSession) //nolint:errcheck
-		close(done)
-	}()
-
-	// 4. Update ImageBuildOptions
 	res, err := cli.ImageBuild(ctx, pr, build.ImageBuildOptions{
 		Tags:        []string{imageTag},
 		Dockerfile:  "Dockerfile",
 		Remove:      true,
 		ForceRemove: true,
-		// IMPORTANT: Set Version to BuildKit and provide the SessionID
-		Version:   build.BuilderBuildKit,
-		SessionID: s.ID(),
 	})
-
-	// buildArgs := make(map[string]*string)
-	// buildArgs["GH_USERNAME"] = &gh_uname
-	// buildArgs["GH_REPOSITORY"] = &gh_repo
-
-	// res, err := cli.ImageBuild(ctx, pr, build.ImageBuildOptions{
-	// 	Tags:        []string{imageTag},
-	// 	Dockerfile:  "Dockerfile",
-	// 	Remove:      true,
-	// 	ForceRemove: true,
-	// 	BuildArgs:   buildArgs,
-	// })
 	if err != nil {
 		return fmt.Errorf("failed to build the image: %w", err)
 	}
@@ -229,7 +174,7 @@ func ensureContainerRunning(
 	ctx context.Context,
 	logger *slog.Logger,
 	cli *client.Client,
-	name, imageTag, hostIP, hostPort, containerPort, mountSource, mountTarget string, //, gh_uname, gh_repo string,
+	name, imageTag, hostIP, hostPort, containerPort, mountSource, dataMountTarget, repoMountTarget string,
 ) (string, bool, error) {
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
@@ -271,12 +216,12 @@ func ensureContainerRunning(
 	} else {
 		logger.DebugContext(ctx, "OPENAI_API_KEY not found")
 	}
-	// if env, ok := os.LookupEnv("GH_TOKEN"); ok {
-	// 	envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
-	// 	logger.DebugContext(ctx, "GH_TOKEN found")
-	// } else {
-	// 	logger.DebugContext(ctx, "GH_TOKEN not found")
-	// }
+	if env, ok := os.LookupEnv("GH_TOKEN"); ok {
+		envList = append(envList, fmt.Sprintf("GH_TOKEN=%s", env))
+		logger.DebugContext(ctx, "GH_TOKEN found")
+	} else {
+		logger.DebugContext(ctx, "GH_TOKEN not found")
+	}
 
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:        imageTag,
@@ -291,10 +236,16 @@ func ensureContainerRunning(
 		}},
 		Mounts: []mount.Mount{
 			{
-				Type:     mount.TypeBind, // Use TypeVolume for named volumes
-				Source:   mountSource,    //"/path/on/host", // Absolute path on host
-				Target:   mountTarget,    //"/path/in/container",
-				ReadOnly: false,          // Optional: set to true for read-only
+				Type:     mount.TypeBind,                               // Use TypeVolume for named volumes
+				Source:   fmt.Sprintf("%s/opencode_data", mountSource), //"/path/on/host", // Absolute path on host
+				Target:   dataMountTarget,                              //"/path/in/container",
+				ReadOnly: false,                                        // Optional: set to true for read-only
+			},
+			{
+				Type:     mount.TypeBind,
+				Source:   fmt.Sprintf("%s/repository", mountSource),
+				Target:   repoMountTarget,
+				ReadOnly: false,
 			},
 		},
 	}, nil, nil, name)
@@ -335,6 +286,78 @@ func ensureSession(
 	return &(*sessions)[0], nil
 }
 
+func ensureRepo(
+	ctx context.Context,
+	logger *slog.Logger,
+	ghToken, ghUsername, ghRepo string,
+	repoDir string, // fixed path, e.g. ~/.local/share/opencode/repos/myrepo
+) error {
+	repoDir = fmt.Sprintf("%s/repository", repoDir)
+	gitDir := filepath.Join(repoDir, ".git")
+
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		// First time — clone
+		logger.InfoContext(ctx, "cloning repository", "dir", repoDir)
+
+		if err := os.MkdirAll(repoDir, 0755); err != nil {
+			return fmt.Errorf("create repo dir: %w", err)
+		}
+
+		cloneURL := fmt.Sprintf("https://%s@github.com/%s/%s.git", ghToken, ghUsername, ghRepo)
+		cmd := exec.CommandContext(ctx, "git", "clone", cloneURL, repoDir)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git clone: %w", err)
+		}
+
+		// Rewrite remote to clean URL
+		cleanURL := fmt.Sprintf("https://github.com/%s/%s.git", ghUsername, ghRepo)
+		if err := exec.CommandContext(ctx, "git", "-C", repoDir, "remote", "set-url", "origin", cleanURL).Run(); err != nil {
+			return fmt.Errorf("rewrite remote: %w", err)
+		}
+
+	} else {
+		// Already cloned — checkout default branch then pull
+		logger.InfoContext(ctx, "updating repository", "dir", repoDir)
+
+		// Get the default branch from remote HEAD
+		out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "remote", "show", "origin").Output()
+		if err != nil {
+			return fmt.Errorf("get remote info: %w", err)
+		}
+
+		defaultBranch := "main" // fallback
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "HEAD branch:") {
+				defaultBranch = strings.TrimSpace(strings.TrimPrefix(line, "HEAD branch:"))
+				break
+			}
+		}
+
+		logger.InfoContext(ctx, "checking out default branch", "branch", defaultBranch)
+
+		// Checkout default branch
+		cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "checkout", defaultBranch)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git checkout %s: %w", defaultBranch, err)
+		}
+
+		// Pull latest
+		cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "pull", "--ff-only")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("git pull: %w", err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
@@ -369,17 +392,22 @@ func main() {
 		buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
 
-		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, imageTag, gh_username, gh_repository); err != nil {
+		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, imageTag); err != nil {
 			logger.Error("application failed in build image", "err", err)
 			os.Exit(1)
 		}
 	}
 
-	// absMountPath, err := filepath.Abs(relativeMountPath)
+	// absBasePath, err := filepath.Abs(relativeMountPath)
 	// if err != nil {
 	// 	logger.Error("application failed to get absolute host path", "err", err)
 	// 	os.Exit(1)
 	// }
+
+	absBasePath := "/Users/sithumsandeepa/pokunuvita"
+	absBasePath = fmt.Sprintf("%s/%s/%s", absBasePath, gh_username, gh_repository)
+
+	err = ensureRepo(ctx, logger, os.Getenv("GH_TOKEN"), gh_username, gh_repository, absBasePath)
 
 	containerID, startedNow, err := ensureContainerRunning(
 		ctx,
@@ -390,11 +418,9 @@ func main() {
 		hostIP,
 		hostPort,
 		containerPort,
-		// absMountPath,
-		"/Users/sithumsandeepa/pokunuvita/opencode_data", //absMountPath,
+		absBasePath, //absMountPath,
 		containerMountPath,
-		// gh_username,
-		// gh_repository,
+		repositoryMountPath,
 	)
 	if err != nil {
 		logger.Error("application failed in ensure container", "err", err)

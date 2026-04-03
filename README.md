@@ -72,3 +72,6 @@
 
 ## Apr 01, 2026
 * Still working on dynamic Docker builds.
+
+## Apr 02, 2026
+* Clone the repository to mount inside of the docker container instead of clone that on during build time.
