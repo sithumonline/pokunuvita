@@ -184,6 +184,21 @@ func ensureContainerRunning(
 		return "", false, fmt.Errorf("failed to get containers list: %w", err)
 	}
 
+	dataDir := fmt.Sprintf("%s/opencode_data", mountSource)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return "", false, fmt.Errorf("failed to create: %s: %w", dataDir, err)
+	} else {
+		s, _ := os.Stat(dataDir)
+		logger.DebugContext(ctx, "this dir already exit", "dir", dataDir, "stat", s)
+	}
+	repoDir := fmt.Sprintf("%s/repository", mountSource)
+	if err := os.MkdirAll(repoDir, 0755); err != nil {
+		return "", false, fmt.Errorf("failed to create: %s: %w", repoDir, err)
+	} else {
+		s, _ := os.Stat(repoDir)
+		logger.DebugContext(ctx, "this dir already exit", "dir", repoDir, "stat", s)
+	}
+
 	for _, ctr := range containers {
 		for _, n := range ctr.Names {
 			if n != fmt.Sprintf("/%s", containerName) {
@@ -236,14 +251,14 @@ func ensureContainerRunning(
 		}},
 		Mounts: []mount.Mount{
 			{
-				Type:     mount.TypeBind,                               // Use TypeVolume for named volumes
-				Source:   fmt.Sprintf("%s/opencode_data", mountSource), //"/path/on/host", // Absolute path on host
-				Target:   dataMountTarget,                              //"/path/in/container",
-				ReadOnly: false,                                        // Optional: set to true for read-only
+				Type:     mount.TypeBind,  // Use TypeVolume for named volumes
+				Source:   dataDir,         //"/path/on/host", // Absolute path on host
+				Target:   dataMountTarget, //"/path/in/container",
+				ReadOnly: false,           // Optional: set to true for read-only
 			},
 			{
 				Type:     mount.TypeBind,
-				Source:   fmt.Sprintf("%s/repository", mountSource),
+				Source:   repoDir,
 				Target:   repoMountTarget,
 				ReadOnly: false,
 			},
@@ -407,9 +422,12 @@ func main() {
 	absBasePath := "/Users/sithumsandeepa/pokunuvita"
 	absBasePath = fmt.Sprintf("%s/%s/%s", absBasePath, gh_username, gh_repository)
 
-	err = ensureRepo(ctx, logger, os.Getenv("GH_TOKEN"), gh_username, gh_repository, absBasePath)
+	if err := ensureRepo(ctx, logger, os.Getenv("GH_TOKEN"), gh_username, gh_repository, absBasePath); err != nil {
+		logger.Error("application failed in ensure repo", "err", err)
+		os.Exit(1)
+	}
 
-	containerID, startedNow, err := ensureContainerRunning(
+	containerID, _, err := ensureContainerRunning(
 		ctx,
 		logger,
 		dockerClient,
@@ -427,10 +445,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if startedNow {
-		logger.Info("waiting for container startup")
-		time.Sleep(5 * time.Second) // do we really need this?
-	}
+	// if startedNow {
+	// 	logger.Info("waiting for container startup")
+	// 	time.Sleep(5 * time.Second) // do we really need this?
+	// }
 
 	opencodeOptions := []option.RequestOption{
 		option.WithBaseURL(fmt.Sprintf("http://localhost:%s", hostPort)),
@@ -438,13 +456,22 @@ func main() {
 
 	opencodeClient := opencode.NewClient(opencodeOptions...)
 
-	opencodeSession, err := ensureSession(ctx, logger, opencodeClient, sessionTitle)
-	if err != nil {
-		logger.Error("application failed in ensure session", "err", err)
-		os.Exit(1)
+	var opencodeSession *opencode.Session
+	containerCheckingTime := time.Now()
+	for {
+		_opencodeSession, err := ensureSession(ctx, logger, opencodeClient, sessionTitle)
+		if err != nil {
+			logger.Error("application failed in ensure session", "err", err)
+			// os.Exit(1)
+			time.Sleep(time.Second)
+		} else {
+			opencodeSession = _opencodeSession
+			logger.Info("application session is running")
+			break
+		}
 	}
 
-	logger.Info("using session", "session_id", opencodeSession.ID, "directory", opencodeSession.Directory)
+	logger.Info("using session", "session_id", opencodeSession.ID, "directory", opencodeSession.Directory, "startupTime", time.Since(containerCheckingTime))
 
 	promptResp, err := opencodeClient.Session.Prompt(context.TODO(), opencodeSession.ID, opencode.SessionPromptParams{
 		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{

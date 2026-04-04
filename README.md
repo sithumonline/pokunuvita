@@ -75,3 +75,10 @@
 
 ## Apr 02, 2026
 * Clone the repository to mount inside of the docker container instead of clone that on during build time.
+
+## Apr 03, 2026
+* Fix bugs of the repo cloning process.
+* Did a bit of refactoring and removed commented codes.
+
+## Apr 04, 2026
+* Fix "Error response from daemon: crun: cannot stat `/Users/sithumsandeepa/pokunuvita/sithumonline/movie-box/opencode_data`: No such file or directory: OCI runtime attempted to invoke a command that was not found"
