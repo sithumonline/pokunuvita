@@ -9,9 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/build"
@@ -285,78 +282,6 @@ func ensureSession(
 
 	logger.Info("reusing existing session", "session_id", (*sessions)[0].ID, "count", len(*sessions))
 	return &(*sessions)[0], nil
-}
-
-func ensureRepo(
-	ctx context.Context,
-	logger *slog.Logger,
-	ghToken, ghUsername, ghRepo string,
-	repoDir string, // fixed path, e.g. ~/.local/share/opencode/repos/myrepo
-) error {
-	repoDir = fmt.Sprintf("%s/repository", repoDir)
-	gitDir := filepath.Join(repoDir, ".git")
-
-	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
-		// First time — clone
-		logger.InfoContext(ctx, "cloning repository", "dir", repoDir)
-
-		if err := os.MkdirAll(repoDir, 0755); err != nil {
-			return fmt.Errorf("create repo dir: %w", err)
-		}
-
-		cloneURL := fmt.Sprintf("https://%s@github.com/%s/%s.git", ghToken, ghUsername, ghRepo)
-		cmd := exec.CommandContext(ctx, "git", "clone", cloneURL, repoDir)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git clone: %w", err)
-		}
-
-		// Rewrite remote to clean URL
-		cleanURL := fmt.Sprintf("https://github.com/%s/%s.git", ghUsername, ghRepo)
-		if err := exec.CommandContext(ctx, "git", "-C", repoDir, "remote", "set-url", "origin", cleanURL).Run(); err != nil {
-			return fmt.Errorf("rewrite remote: %w", err)
-		}
-
-	} else {
-		// Already cloned — checkout default branch then pull
-		logger.InfoContext(ctx, "updating repository", "dir", repoDir)
-
-		// Get the default branch from remote HEAD
-		out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "remote", "show", "origin").Output()
-		if err != nil {
-			return fmt.Errorf("get remote info: %w", err)
-		}
-
-		defaultBranch := "main" // fallback
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "HEAD branch:") {
-				defaultBranch = strings.TrimSpace(strings.TrimPrefix(line, "HEAD branch:"))
-				break
-			}
-		}
-
-		logger.InfoContext(ctx, "checking out default branch", "branch", defaultBranch)
-
-		// Checkout default branch
-		cmd := exec.CommandContext(ctx, "git", "-C", repoDir, "checkout", defaultBranch)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git checkout %s: %w", defaultBranch, err)
-		}
-
-		// Pull latest
-		cmd = exec.CommandContext(ctx, "git", "-C", repoDir, "pull", "--ff-only")
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("git pull: %w", err)
-		}
-	}
-
-	return nil
 }
 
 func main() {
