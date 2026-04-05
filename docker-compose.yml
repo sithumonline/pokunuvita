@@ -7,5 +7,9 @@ services:
     ports:
       - "3000:3000"
     restart: unless-stopped
+    environment:
+      - GH_USERNAME=sithumonline
+      - GH_REPOSITORY=movie-box
+      - GH_TOKEN=${GH_TOKEN}
     # volumes:
     #   - ./opencode_data:/root/.local/share/opencode

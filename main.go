@@ -174,7 +174,7 @@ func ensureContainerRunning(
 	ctx context.Context,
 	logger *slog.Logger,
 	cli *client.Client,
-	name, imageTag, hostIP, hostPort, containerPort, mountSource, dataMountTarget, repoMountTarget string,
+	name, imageTag, hostIP, hostPort, containerPort, mountSource, dataMountTarget, gh_uname, gh_repo string,
 ) (string, bool, error) {
 	containers, err := cli.ContainerList(ctx, container.ListOptions{
 		All:     true,
@@ -190,13 +190,6 @@ func ensureContainerRunning(
 	} else {
 		s, _ := os.Stat(dataDir)
 		logger.DebugContext(ctx, "this dir already exit", "dir", dataDir, "stat", s)
-	}
-	repoDir := fmt.Sprintf("%s/repository", mountSource)
-	if err := os.MkdirAll(repoDir, 0755); err != nil {
-		return "", false, fmt.Errorf("failed to create: %s: %w", repoDir, err)
-	} else {
-		s, _ := os.Stat(repoDir)
-		logger.DebugContext(ctx, "this dir already exit", "dir", repoDir, "stat", s)
 	}
 
 	for _, ctr := range containers {
@@ -223,8 +216,7 @@ func ensureContainerRunning(
 		return "", false, fmt.Errorf("failed to bind the port to continer: %w", err)
 	}
 
-	// envList := []string{fmt.Sprintf("GH_USERNAME=%s", gh_uname), fmt.Sprintf("GH_REPOSITORY=%s", gh_repo)}
-	var envList []string
+	envList := []string{fmt.Sprintf("GH_USERNAME=%s", gh_uname), fmt.Sprintf("GH_REPOSITORY=%s", gh_repo)}
 	if env, ok := os.LookupEnv("OPENAI_API_KEY"); ok {
 		envList = append(envList, fmt.Sprintf("OPENAI_API_KEY=%s", env))
 		logger.DebugContext(ctx, "OPENAI_API_KEY found")
@@ -255,12 +247,6 @@ func ensureContainerRunning(
 				Source:   dataDir,         //"/path/on/host", // Absolute path on host
 				Target:   dataMountTarget, //"/path/in/container",
 				ReadOnly: false,           // Optional: set to true for read-only
-			},
-			{
-				Type:     mount.TypeBind,
-				Source:   repoDir,
-				Target:   repoMountTarget,
-				ReadOnly: false,
 			},
 		},
 	}, nil, nil, name)
@@ -422,11 +408,6 @@ func main() {
 	absBasePath := "/Users/sithumsandeepa/pokunuvita"
 	absBasePath = fmt.Sprintf("%s/%s/%s", absBasePath, gh_username, gh_repository)
 
-	if err := ensureRepo(ctx, logger, os.Getenv("GH_TOKEN"), gh_username, gh_repository, absBasePath); err != nil {
-		logger.Error("application failed in ensure repo", "err", err)
-		os.Exit(1)
-	}
-
 	containerID, _, err := ensureContainerRunning(
 		ctx,
 		logger,
@@ -438,7 +419,8 @@ func main() {
 		containerPort,
 		absBasePath, //absMountPath,
 		containerMountPath,
-		repositoryMountPath,
+		gh_username,
+		gh_repository,
 	)
 	if err != nil {
 		logger.Error("application failed in ensure container", "err", err)
