@@ -83,3 +83,17 @@
 ## Apr 04, 2026
 * Fix "Error response from daemon: crun: cannot stat `/Users/sithumsandeepa/pokunuvita/sithumonline/movie-box/opencode_data`: No such file or directory: OCI runtime attempted to invoke a command that was not found".
 * Start working dynamic Docker build with the help of `entrypoint.sh` and it worked with the docker compose.
+
+## Apr 05, 2026
+* Get the Kimi 2 API key and try k2.5
+* Start to build the API server for handle multiple repose at once.
+* Start to design database for API server.
+
+## Apr 09, 2026
+* Tried to make Kimi 2 API works but couldn't make it.
+
+## Apr 10, 2026
+* Make it worked with manually setting credentials.
+
+## Apr 11, 2026
+* Managed to set auth credentials via API (client.Execute)

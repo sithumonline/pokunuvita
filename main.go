@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 	"github.com/sst/opencode-sdk-go"
 	"github.com/sst/opencode-sdk-go/option"
@@ -37,6 +39,7 @@ const (
 	containerPort = "3000"
 
 	dockerfilePath = "Dockerfile"
+	entrypointPath = "entrypoint.sh"
 	sessionTitle   = "opencode development session"
 	promptText     = `
 You are working inside a Docker container on a Go repository. Complete the following upgrade workflow end-to-end:
@@ -113,34 +116,22 @@ func buildImageFromDockerfileOnly(
 	logger *slog.Logger,
 	cli *client.Client,
 	dockerfilePath string,
+	entrypointPath string,
 	imageTag string,
 ) error {
 	pr, pw := io.Pipe()
-
 	go func() {
 		tw := tar.NewWriter(pw)
 		defer tw.Close()
 		defer pw.Close()
 
-		content, err := os.ReadFile(dockerfilePath)
-		if err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("read dockerfile %q: %w", dockerfilePath, err))
+		if err := addFileToTar(tw, "Dockerfile", dockerfilePath); err != nil {
+			_ = pw.CloseWithError(err)
 			return
 		}
 
-		hdr := &tar.Header{
-			Name: "Dockerfile",
-			Mode: 0600,
-			Size: int64(len(content)),
-		}
-
-		if err := tw.WriteHeader(hdr); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("write dockerfile header: %w", err))
-			return
-		}
-
-		if _, err := tw.Write(content); err != nil {
-			_ = pw.CloseWithError(fmt.Errorf("write dockerfile content: %w", err))
+		if err := addFileToTar(tw, "entrypoint.sh", entrypointPath); err != nil {
+			_ = pw.CloseWithError(err)
 			return
 		}
 	}()
@@ -159,12 +150,29 @@ func buildImageFromDockerfileOnly(
 	scanner := bufio.NewScanner(res.Body)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 1024*1024)
-
 	for scanner.Scan() {
 		logger.Info("docker build", "output", scanner.Text())
 	}
-
 	return scanner.Err()
+}
+
+func addFileToTar(tw *tar.Writer, nameInTar string, filePath string) error {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return fmt.Errorf("read %q: %w", filePath, err)
+	}
+	hdr := &tar.Header{
+		Name: nameInTar,
+		Mode: 0755, // executable for entrypoint.sh, fine for Dockerfile too
+		Size: int64(len(content)),
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		return fmt.Errorf("write tar header for %q: %w", nameInTar, err)
+	}
+	if _, err := tw.Write(content); err != nil {
+		return fmt.Errorf("write tar content for %q: %w", nameInTar, err)
+	}
+	return nil
 }
 
 func ensureContainerRunning(
@@ -284,6 +292,42 @@ func ensureSession(
 	return &(*sessions)[0], nil
 }
 
+// stream container logs to your slog logger
+func streamContainerLogs(ctx context.Context, logger *slog.Logger, cli *client.Client, containerID string) {
+	go func() {
+		r, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+			ShowStdout: true,
+			ShowStderr: true,
+			Follow:     true,
+			Tail:       "200",
+			Timestamps: true,
+		})
+		if err != nil {
+			logger.Error("container logs", "err", err)
+			return
+		}
+		defer r.Close()
+
+		// stdout/stderr are multiplexed
+		stdout := slogWriter{logger: logger, level: slog.LevelInfo, prefix: "ctr.stdout"}
+		stderr := slogWriter{logger: logger, level: slog.LevelError, prefix: "ctr.stderr"}
+
+		_, _ = stdcopy.StdCopy(stdout, stderr, r)
+	}()
+}
+
+type slogWriter struct {
+	logger *slog.Logger
+	level  slog.Level
+	prefix string
+}
+
+func (w slogWriter) Write(p []byte) (int, error) {
+	// avoid spamming per-line? keep it simple for now
+	w.logger.Log(context.Background(), w.level, w.prefix, "msg", string(p))
+	return len(p), nil
+}
+
 func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
@@ -318,7 +362,7 @@ func main() {
 		buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 		defer cancel()
 
-		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, imageTag); err != nil {
+		if err := buildImageFromDockerfileOnly(buildCtx, logger, dockerClient, dockerfilePath, entrypointPath, imageTag); err != nil {
 			logger.Error("application failed in build image", "err", err)
 			os.Exit(1)
 		}
@@ -352,6 +396,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	streamContainerLogs(ctx, logger, dockerClient, containerID)
+
 	// if startedNow {
 	// 	logger.Info("waiting for container startup")
 	// 	time.Sleep(5 * time.Second) // do we really need this?
@@ -380,12 +426,55 @@ func main() {
 
 	logger.Info("using session", "session_id", opencodeSession.ID, "directory", opencodeSession.Directory, "startupTime", time.Since(containerCheckingTime))
 
-	promptResp, err := opencodeClient.Session.Prompt(context.TODO(), opencodeSession.ID, opencode.SessionPromptParams{
+	kimiAPIKey, ok := os.LookupEnv("KIMI_API_KEY")
+	if !ok {
+		logger.Error("kimi API key is not set in env")
+		os.Exit(1)
+	}
+
+	var res any
+	err = opencodeClient.Execute(ctx, http.MethodPut, "auth/moonshotai", map[string]string{
+		"type": "api", "key": kimiAPIKey,
+	}, &res)
+	if err != nil {
+		logger.Error("auth/moonshotai API call failed", "err", err)
+		os.Exit(1)
+	}
+
+	logger.Info("auth/moonshotai is done", "res", res)
+
+	err = opencodeClient.Execute(ctx, http.MethodPost, "global/dispose", nil, &res)
+	if err != nil {
+		logger.Error("global/dispose API call failed", "err", err)
+		os.Exit(1)
+	}
+
+	logger.Info("global/dispose is done", "res", res)
+
+	resp, err := opencodeClient.App.Providers(ctx, opencode.AppProvidersParams{Directory: opencode.F("/app/repository")})
+	if err != nil {
+		logger.Error("providers", "err", err)
+		os.Exit(1)
+	}
+
+	for _, p := range resp.Providers {
+		logger.Info("provider", "id", p.ID, "name", p.Name, "models", len(p.Models))
+		for modelID, m := range p.Models {
+			logger.Info("model", "provider", p.ID, "modelID", modelID, "name", m.Name)
+		}
+	}
+
+	promptResp, err := opencodeClient.Session.Prompt(ctx, opencodeSession.ID, opencode.SessionPromptParams{
+		Directory: opencode.F("/app/repository"),
 		Parts: opencode.F([]opencode.SessionPromptParamsPartUnion{
 			opencode.TextPartInputParam{
 				Type: opencode.F(opencode.TextPartInputTypeText),
 				Text: opencode.F(promptText),
 			},
+		}),
+		Model: opencode.F(opencode.SessionPromptParamsModel{
+			ProviderID: opencode.F("moonshotai"),
+			ModelID:    opencode.F("kimi-k2.5"),
 		}),
 	})
 

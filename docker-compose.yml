@@ -11,5 +11,6 @@ services:
       - GH_USERNAME=sithumonline
       - GH_REPOSITORY=movie-box
       - GH_TOKEN=${GH_TOKEN}
+      - KIMI_API_KEY=${KIMI_API_KEY}
     # volumes:
     #   - ./opencode_data:/root/.local/share/opencode
